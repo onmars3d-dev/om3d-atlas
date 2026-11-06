@@ -12,7 +12,7 @@ import os
 
 import bpy
 
-from . import density, maps, packer, planner
+from . import density, layout as atlas_layout, maps, packer, planner
 
 
 def _read_version():
@@ -64,6 +64,9 @@ def _isolate_changed(self, context):
         packer.isolate_restore(context)
 
 
+# Blender 4.5+ warns about a // default on a DIR_PATH unless it says it supports it
+_PATH_OPTS = {"options": {"PATH_SUPPORTS_BLEND_RELATIVE"}} if bpy.app.version >= (4, 5, 0) else {}
+
 SIZES = [("2048", "2K", ""), ("4096", "4K", ""), ("8192", "8K", "")]
 OP_MODES = [
     ("AUTO", "Auto", "Masked if the opacity map has real transparency, opaque if it is almost solid"),
@@ -84,8 +87,10 @@ _enum_cache = {}
 def _tile_items(self, context):
     """Tile dropdown: 'Auto 2K' shows what Auto picked; the rest force a size."""
     auto = f"Auto {_k(self.tile)}" if self.tile else "Auto"
-    if self.filled:
+    if self.plan_note == "fill":
         auto += " (filled)"
+    elif self.plan_note == "budget":
+        auto += " (shrunk)"
     items = [("0", auto, "Smallest tile that meets the density target (Auto Plan may grow it to fill free space)", 0)]
     items += [(str(z), _k(z), f"Force a {_k(z)} tile", i + 1)
               for i, z in enumerate((256, 512, 1024, 2048, 4096, 8192))]
@@ -234,8 +239,9 @@ class OM3D_AT_Item(bpy.types.PropertyGroup):
                                     description="Leave this material out (hair cards, for example)")
     override: bpy.props.EnumProperty(name="Tile", items=_tile_items, update=_relayout,
                                      description="Tile size. Auto picks the smallest that meets the target")
-    fill_tile: bpy.props.IntProperty()
-    filled: bpy.props.BoolProperty()
+    plan_tile: bpy.props.IntProperty()
+    plan_kind: bpy.props.StringProperty()
+    plan_note: bpy.props.StringProperty()   # "fill" / "budget" when that size is in use
     op_mode: bpy.props.EnumProperty(name="Opacity", items=OP_MODES, update=_rescan,
                                     description="How the opacity map is treated")
     masked: bpy.props.BoolProperty()
@@ -249,6 +255,10 @@ class OM3D_AT_Item(bpy.types.PropertyGroup):
     ignored: bpy.props.StringProperty()
     object_count: bpy.props.IntProperty()
     note: bpy.props.StringProperty()
+    uv_tile: bpy.props.StringProperty()   # UDIM-style tiles the UVs are shifted back from
+    src_tile_u: bpy.props.IntProperty()   # tile the material's UVs sit in (UDIM source textures read this tile)
+    src_tile_v: bpy.props.IntProperty()
+    udim: bpy.props.BoolProperty()        # a source map is a UDIM (TILED) image
     uv_error: bpy.props.BoolProperty()
     tile: bpy.props.IntProperty()
     td_tile: bpy.props.FloatProperty(default=-1)
@@ -263,6 +273,7 @@ class OM3D_AT_Set(bpy.types.PropertyGroup):
     count: bpy.props.IntProperty()
     mixed: bpy.props.BoolProperty()
     masked: bpy.props.BoolProperty()
+    color: bpy.props.FloatVectorProperty(subtype="COLOR", size=3, min=0, max=1, default=(0.5, 0.5, 0.5))
 
 
 class OM3D_AT_Result(bpy.types.PropertyGroup):
@@ -282,6 +293,14 @@ class OM3D_AT_State(bpy.types.PropertyGroup):
         name="Fill Empty Space", default=True,
         description=("Auto Plan grows tiles (lowest density first) into space left empty in a sheet. "
                      "It never adds a sheet, makes a sheet bigger, or changes a tile you set by hand"))
+    max_sets: bpy.props.IntProperty(
+        name="Max Sets", default=0, min=0, max=32,
+        description=("Cap on the number of atlas sets (opaque + masked). Auto Plan shrinks the tiles that lose "
+                     "the least density until the plan fits, so some may drop below the target. 0 = off: "
+                     "density first, sets added as needed"))
+    over_budget: bpy.props.BoolProperty()
+    preview_on: bpy.props.BoolProperty()
+    layout_path: bpy.props.StringProperty()
     inset: bpy.props.IntProperty(name="Atlas Padding px", default=8, min=0, max=64, update=_relayout,
                                  description=TIP_PADDING)
     include_hidden: bpy.props.BoolProperty(name="Count Hidden Objects", update=_rescan,
@@ -290,7 +309,7 @@ class OM3D_AT_State(bpy.types.PropertyGroup):
                                     description="Hide every object that won't be packed. Turn off to restore your visibility")
     file_format: bpy.props.EnumProperty(name="Format", items=[("TARGA", "TGA", ""), ("PNG", "PNG", "")])
     output_dir: bpy.props.StringProperty(name="Output", default="//Textures/Atlas", subtype="DIR_PATH",
-                                         description="Folder for the atlas textures")
+                                         description="Folder for the atlas textures", **_PATH_OPTS)
     items: bpy.props.CollectionProperty(type=OM3D_AT_Item)
     index: bpy.props.IntProperty()
     sets: bpy.props.CollectionProperty(type=OM3D_AT_Set)
@@ -336,7 +355,22 @@ class OM3D_OT_atlas_pack(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
+        files = packer.planned_files(context)
+        existing = [f for f in files if os.path.exists(f)]
+        wm = context.window_manager
+        if existing:
+            folder = os.path.dirname(existing[0])
+            try:
+                return wm.invoke_confirm(self, event, title="Overwrite Atlas Textures?",
+                                         message=f"{len(existing)} of {len(files)} files already exist in {folder}",
+                                         confirm_text="Overwrite", icon="WARNING")
+            except TypeError:      # Blender < 4.1: no custom text
+                return wm.invoke_confirm(self, event)
+        try:
+            return wm.invoke_confirm(self, event, title="Pack Atlases",
+                                     message=f"Write {len(files)} textures", confirm_text="Pack")
+        except TypeError:
+            return wm.invoke_confirm(self, event)
 
     def execute(self, context):
         try:
@@ -345,24 +379,95 @@ class OM3D_OT_atlas_pack(bpy.types.Operator):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         msg = f"{r['sets']} sets, {r['images']} textures, {r['meshes']} meshes"
-        context.scene.om3d_atlas.last_report = msg
+        state = context.scene.om3d_atlas
+        state.last_report = msg
+        try:
+            if atlas_layout.render(context) is not None and state.layout_path:
+                packer.record_written(context, state.layout_path)
+        except Exception as exc:              # a preview image must never fail the pack
+            self.report({"WARNING"}, f"Layout image skipped: {exc}")
         self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class OM3D_OT_atlas_layout_image(bpy.types.Operator):
+    bl_idname = "om3d.atlas_layout_image"
+    bl_label = "Layout Image"
+    bl_description = ("Draw the current plan (sheets, tiles, size, px/cm, low tiles in red) to "
+                      "<Prefix>_Layout.png in the output folder and show it in an Image Editor")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if bpy.app.background:
+            self.report({"WARNING"}, "Layout Image needs the Blender window (GPU)")
+            return {"CANCELLED"}
+        img = atlas_layout.render(context)
+        if img is None:
+            self.report({"WARNING"}, "Nothing planned yet: run Auto Plan first")
+            return {"CANCELLED"}
+        atlas_layout.show(context, img)
+        path = context.scene.om3d_atlas.layout_path
+        self.report({"INFO"}, f"Saved {path}" if path else "Layout shown (save the .blend to write the PNG)")
+        return {"FINISHED"}
+
+
+class OM3D_OT_atlas_preview_colors(bpy.types.Operator):
+    bl_idname = "om3d.atlas_preview_colors"
+    bl_label = "Preview Colors"
+    bl_description = ("Colour every object by its atlas set (grey = not packed) and switch the viewports "
+                      "to Solid with Object colour. Material Preview puts everything back")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        n = packer.preview_colors(context)
+        self.report({"INFO"}, f"{n} objects coloured by set")
+        return {"FINISHED"}
+
+
+class OM3D_OT_atlas_material_preview(bpy.types.Operator):
+    bl_idname = "om3d.atlas_material_preview"
+    bl_label = "Material Preview"
+    bl_description = "Restore the objects' own colours and switch the viewports back to Material Preview"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        packer.preview_restore(context)
         return {"FINISHED"}
 
 
 class OM3D_OT_atlas_revert(bpy.types.Operator):
     bl_idname = "om3d.atlas_revert"
     bl_label = "Revert"
-    bl_description = "Put the original materials back and remove AtlasUV. Texture files stay on disk"
+    bl_description = ("Put the original materials back, remove AtlasUV, and delete the atlas textures "
+                      "and layout image the last Pack wrote")
     bl_options = {"REGISTER", "UNDO"}
 
+    delete_files: bpy.props.BoolProperty(
+        name="Delete Packed Textures", default=True,
+        description="Delete the files the last Pack wrote (only those). Undo can't bring them back")
+
     def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
+        n = len(packer.written_files(context))
+        wm = context.window_manager
+        msg = (f"Restore the original materials and delete {n} packed files. Undo can't restore deleted files"
+               if n and self.delete_files else "Restore the original materials")
+        try:
+            return wm.invoke_confirm(self, event, title="Revert Atlas", message=msg,
+                                     confirm_text="Revert", icon="WARNING" if n else "NONE")
+        except TypeError:
+            return wm.invoke_confirm(self, event)
 
     def execute(self, context):
-        r = packer.revert(context)
+        r = packer.revert(context, delete_files=self.delete_files)
         context.scene.om3d_atlas.last_report = ""
-        self.report({"INFO"}, f"Reverted {r['objects']} objects, {r['meshes']} meshes")
+        msg = f"Reverted {r['objects']} objects, deleted {r['deleted']} files"
+        if r["kept"]:
+            msg += f"; kept {len(r['kept'])} still used in this file"
+        if r["failed"]:
+            msg += f"; couldn't delete {', '.join(r['failed'][:3])}"
+            self.report({"WARNING"}, msg)
+        else:
+            self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
@@ -581,6 +686,10 @@ class OM3D_PT_atlas_2_choose(_AtlasStep, bpy.types.Panel):
             r.label(text=f"Ignored in density: {n}", icon="GHOST_DISABLED")
             op = r.operator("om3d.atlas_td_ignore", text="", icon="LOOP_BACK")
             op.name, op.material, op.ignore = n, it.name, False
+        if it.uv_tile:
+            col.label(text=f"UVs in tile {it.uv_tile}: moved to 0-1 for packing", icon="INFO")
+        if it.udim and not it.uv_error:
+            col.label(text=f"UDIM textures: reads tile {1001 + it.src_tile_u + 10 * it.src_tile_v}", icon="INFO")
         if it.note:
             for part in it.note.split(" | "):
                 col.label(text=part, icon="ERROR")
@@ -606,6 +715,13 @@ class OM3D_PT_atlas_3_name(_AtlasStep, bpy.types.Panel):
         c.label(text=packer.texture_name(context, state, sets[0], "N") + packer.EXT[state.file_format])
 
 
+def _preview_row(layout, state):
+    row = layout.row(align=True)
+    row.operator("om3d.atlas_preview_colors", icon="COLOR", depress=state.preview_on)
+    row.operator("om3d.atlas_material_preview", icon="MATERIAL")
+    layout.operator("om3d.atlas_layout_image", icon="IMAGE_PLANE")
+
+
 class OM3D_PT_atlas_4_plan(_AtlasStep, bpy.types.Panel):
     bl_label = "4  Plan"
 
@@ -618,7 +734,10 @@ class OM3D_PT_atlas_4_plan(_AtlasStep, bpy.types.Panel):
         col.prop(state, "target_td")
         col.prop(state, "inset")
         col.prop(state, "fill_gaps")
+        col.prop(state, "max_sets")
         layout.operator("om3d.atlas_auto_plan", icon="AUTO")
+        if state.max_sets and state.over_budget:
+            layout.label(text=f"Can't reach {state.max_sets} sets: every tile is at its smallest", icon="ERROR")
 
         index = {it.name: i for i, it in enumerate(state.items)}
         groups = {}
@@ -638,6 +757,10 @@ class OM3D_PT_atlas_4_plan(_AtlasStep, bpy.types.Panel):
                 head.label(text="No set", icon="ERROR")
             elif st and st.size:
                 kind = "masked" if st.masked else "opaque"
+                if state.preview_on:
+                    sw = head.row()
+                    sw.ui_units_x = 1
+                    sw.prop(st, "color", text="")
                 head.label(text=f"{name}   {_k(st.size)}   {st.fill * 100:.0f}% used   {kind}",
                            icon="ERROR" if st.mixed else "TEXTURE")
             else:
@@ -662,6 +785,7 @@ class OM3D_PT_atlas_4_plan(_AtlasStep, bpy.types.Panel):
                             icon="ERROR" if low else "BLANK1")
         if order:
             layout.label(text="Tile dropdown sets the size. Number = px/cm at that size.")
+            _preview_row(layout, state)
 
         if sel is not None and not sel.exclude:
             b = layout.box()
@@ -674,8 +798,10 @@ class OM3D_PT_atlas_4_plan(_AtlasStep, bpy.types.Panel):
 
             if sel.worst_obj:
                 c.label(text=f"Worst object: {sel.worst_obj}")
-            if sel.filled:
+            if sel.plan_note == "fill":
                 c.label(text="Grown by Fill Empty Space", icon="INFO")
+            elif sel.plan_note == "budget":
+                c.label(text=f"Shrunk to fit Max Sets {state.max_sets}", icon="INFO")
             if sel.flag == planner.FLAG_CLAMP:
                 c.label(text="Tile clamped to source size", icon="INFO")
             if sel.flag == planner.FLAG_LOW:
@@ -693,6 +819,7 @@ class OM3D_PT_atlas_5_pack(_AtlasStep, bpy.types.Panel):
             if state.last_report:
                 layout.label(text=state.last_report, icon="CHECKMARK")
             layout.operator("om3d.atlas_revert", icon="LOOP_BACK")
+            _preview_row(layout, state)
             return
         row = layout.row(align=True)
         row.prop(state, "file_format", text="")
@@ -728,6 +855,10 @@ class OM3D_PT_atlas_6_results(_AtlasStep, bpy.types.Panel):
         layout.label(text=f"{sets} sets, {texs} textures")
         if state.results_dir:
             layout.label(text=state.results_dir, icon="FILE_FOLDER")
+        if state.layout_path:
+            r = layout.row(align=True)
+            r.label(text=os.path.basename(state.layout_path), icon="IMAGE_PLANE")
+            r.operator("om3d.atlas_layout_image", text="", icon="HIDE_OFF")
         b = None
         for r in state.results:
             if r.kind == "SET":
@@ -751,6 +882,9 @@ classes = (
     OM3D_OT_atlas_scan,
     OM3D_OT_atlas_auto_plan,
     OM3D_OT_atlas_pack,
+    OM3D_OT_atlas_layout_image,
+    OM3D_OT_atlas_preview_colors,
+    OM3D_OT_atlas_material_preview,
     OM3D_OT_atlas_revert,
     OM3D_OT_atlas_select_object,
     OM3D_OT_atlas_pick,

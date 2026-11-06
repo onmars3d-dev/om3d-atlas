@@ -17,6 +17,43 @@ def load(image):
     return a.reshape(h, w, 4)
 
 
+def udim_number(tile):
+    """UDIM tile number for a (u, v) unit tile: (0, 0) -> 1001, (3, 1) -> 1014."""
+    u, v = tile
+    return 1001 + u + 10 * v
+
+
+def tile_path(image, tile):
+    """File of one UDIM tile of a TILED image, or None if it isn't on disk."""
+    path = bpy.path.abspath(image.filepath)
+    n = str(udim_number(tile))
+    if "<UDIM>" in path:
+        path = path.replace("<UDIM>", n)
+    elif "<UVTILE>" in path:
+        u, v = tile
+        path = path.replace("<UVTILE>", f"u{u + 1}_v{v + 1}")
+    else:
+        return None
+    return path if os.path.exists(path) else None
+
+
+def load_source(image, tile=(0, 0)):
+    """(pixels, channels) of a source texture. For a UDIM (TILED) image, Image.pixels only
+    holds the first tile, so the tile file the material's UVs point at is loaded instead."""
+    if image.source != "TILED":
+        return load(image), image.channels
+    path = tile_path(image, tile)
+    if path is None:
+        raise RuntimeError(f"{image.name}: UDIM tile {udim_number(tile)} not found on disk")
+    tmp = bpy.data.images.load(path, check_existing=False)
+    try:
+        tmp.colorspace_settings.name = image.colorspace_settings.name
+        tmp.alpha_mode = image.alpha_mode
+        return load(tmp), tmp.channels
+    finally:
+        bpy.data.images.remove(tmp)
+
+
 def _half(a):
     h, w = a.shape[:2]
     return a[: h - h % 2, : w - w % 2].reshape(h // 2, 2, w // 2, 2, 4).mean(axis=(1, 3))

@@ -14,7 +14,7 @@ UV_EPS = 1e-3
 
 
 class ObjStat:
-    __slots__ = ("obj", "uv_area", "world_cm2", "visible", "uv_out", "no_uv")
+    __slots__ = ("obj", "uv_area", "world_cm2", "visible", "uv_out", "no_uv", "bbox", "tile")
 
     def __init__(self, obj, visible):
         self.obj = obj
@@ -23,6 +23,8 @@ class ObjStat:
         self.visible = visible
         self.uv_out = False
         self.no_uv = False
+        self.bbox = None     # [umin, vmin, umax, vmax] of this material's UVs on this object
+        self.tile = (0, 0)   # UDIM-style unit tile the UVs sit in
 
     def td(self, res):
         if self.world_cm2 <= 0 or self.uv_area <= 0:
@@ -36,6 +38,19 @@ def source_uv(mesh):
         if l.active_render:
             return l
     return mesh.uv_layers.active
+
+
+def unit_tile(bbox):
+    """(tu, tv) of the single unit square holding *bbox*, or None if it spans more than one.
+    Lets per-material UDIM layouts (each material in its own tile) pack like 0-1 UVs."""
+    if bbox is None:
+        return (0, 0)
+    umin, vmin, umax, vmax = bbox
+    tu = math.floor(umin + UV_EPS)
+    tv = math.floor(vmin + UV_EPS)
+    if umin < tu - UV_EPS or vmin < tv - UV_EPS or umax > tu + 1 + UV_EPS or vmax > tv + 1 + UV_EPS:
+        return None
+    return (tu, tv)
 
 
 def mesh_objects(context):
@@ -72,13 +87,23 @@ def gather(context, materials):
                 continue
             pts = [l[uvl].uv for l in f.loops]
             a = 0.0
+            b = st.bbox
             for k in range(len(pts)):
                 p, q = pts[k], pts[(k + 1) % len(pts)]
                 a += p.x * q.y - q.x * p.y
-                if not st.uv_out and not (-UV_EPS <= p.x <= 1 + UV_EPS and -UV_EPS <= p.y <= 1 + UV_EPS):
-                    st.uv_out = True
+                if b is None:
+                    b = st.bbox = [p.x, p.y, p.x, p.y]
+                else:
+                    if p.x < b[0]: b[0] = p.x
+                    if p.y < b[1]: b[1] = p.y
+                    if p.x > b[2]: b[2] = p.x
+                    if p.y > b[3]: b[3] = p.y
             st.uv_area += abs(a) * 0.5
         bm.free()
+        for st in stats.values():
+            t = unit_tile(st.bbox)
+            st.uv_out = t is None
+            st.tile = t or (0, 0)
         # several slots can hold the same material: merge them
         merged = {}
         for i, st in stats.items():
@@ -89,7 +114,7 @@ def gather(context, materials):
             else:
                 m.uv_area += st.uv_area
                 m.world_cm2 += st.world_cm2
-                m.uv_out = m.uv_out or st.uv_out
+                m.uv_out = m.uv_out or st.uv_out or (m.tile != st.tile)
                 m.no_uv = m.no_uv or st.no_uv
         for name, st in merged.items():
             out[name].append(st)
