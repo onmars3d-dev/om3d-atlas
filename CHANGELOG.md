@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.5 (2026-11-13)
+
+- Revert lets you choose what happens to the packed textures: Move (to the `_reverted` folder, the default), Delete (for good, handy while testing so old atlases don't pile up) or Keep. The choice is remembered until Blender closes. Delete follows the same safety rules as Move: only files the last Pack wrote, and only if they are unchanged since Pack.
+
 ## v0.4.4 (2026-11-13)
 
 - Revert no longer deletes anything. It moves the files the last Pack wrote into a `_reverted` folder next to them, and only files that are unchanged since Pack (same size and modified time). A texture you repainted or re-exported, a file another image in the .blend still uses, and anything that isn't a texture all stay where they are and are listed.

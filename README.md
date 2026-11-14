@@ -40,7 +40,7 @@ The panel walks through six steps. Later steps stay greyed out until Scan has ru
 - Atlas Padding: 8 px per tile edge by default, filled by edge-extend.
 - `AtlasUV` becomes UV channel 0, and the original UV stays on channel 1. Shared mesh data is processed once. UVs that span more than one 0-1 tile, or a missing UV map, block the pack and name the object. A material sitting in a single other tile (UDIM-style) is moved back to 0-1, and UDIM texture sets are read tile by tile. An existing `AtlasUV` map is kept as `AtlasUV_prev`.
 - Opaque sets never carry alpha. Original materials get a fake user while packed so Revert survives a save and reopen.
-- Objects store their original materials, and Revert restores materials, removes AtlasUV and moves the files the last Pack wrote into a `_reverted` folder (only files unchanged since Pack; nothing is deleted). To undo a Pack use Revert, not Ctrl+Z: undo can't take back the files. Work in Object Mode. The tool never saves the .blend. The .blend must be saved before packing, because the output folder is relative to it.
+- Objects store their original materials, and Revert restores materials, removes AtlasUV and moves the files the last Pack wrote into a `_reverted` folder, deletes them or keeps them, as you choose in the Revert dialog (only files unchanged since Pack are touched). To undo a Pack use Revert, not Ctrl+Z: undo can't take back the files. Work in Object Mode. The tool never saves the .blend. The .blend must be saved before packing, because the output folder is relative to it.
 
 ## Known limits
 

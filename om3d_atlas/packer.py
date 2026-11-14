@@ -755,9 +755,11 @@ def _unchanged(rec):
     return st.st_size == rec["size"] and st.st_mtime_ns == rec["mtime"]
 
 
-def _delete_written(context):
-    """Take away the files the last Pack wrote. Nothing is deleted: each file is moved to a
-    "_reverted" folder next to it, so a file another .blend still uses can be put back.
+def _delete_written(context, permanent=False):
+    """Take away the files the last Pack wrote. By default nothing is deleted: each file is
+    moved to a "_reverted" folder next to it, so a file another .blend still uses can be put
+    back. With permanent=True the files are deleted instead (no way back).
+    Either way the same checks apply:
     A file is left alone when an image in this .blend still uses it, when it isn't a
     texture, or when it changed since Pack (repainted, re-exported, or not ours at all).
     Returns (moved, kept names, failed names)."""
@@ -777,9 +779,12 @@ def _delete_written(context):
             kept.append(base + " (changed since Pack)")
             continue
         try:
-            folder = os.path.join(os.path.dirname(p), REVERTED_DIR)
-            os.makedirs(folder, exist_ok=True)
-            os.replace(p, os.path.join(folder, base))
+            if permanent:
+                os.remove(p)
+            else:
+                folder = os.path.join(os.path.dirname(p), REVERTED_DIR)
+                os.makedirs(folder, exist_ok=True)
+                os.replace(p, os.path.join(folder, base))
             moved += 1
         except OSError:
             failed.append(base)
@@ -788,7 +793,7 @@ def _delete_written(context):
     return moved, kept, failed
 
 
-def revert(context, delete_files=True):
+def revert(context, delete_files=True, permanent=False):
     objs = [o for o in bpy.data.objects if P_ORIG in o]
     for o in objs:
         names = json.loads(o[P_ORIG])
@@ -830,7 +835,7 @@ def revert(context, delete_files=True):
     for img in [i for i in bpy.data.images if i.get("om3d_atlas_layout") and i.users == 0]:
         bpy.data.images.remove(img)
     if delete_files:
-        deleted, kept, failed = _delete_written(context)
+        deleted, kept, failed = _delete_written(context, permanent)
     else:
         deleted, kept, failed = 0, [], []
         # the user is keeping these files: forget them, so no later Revert can take them

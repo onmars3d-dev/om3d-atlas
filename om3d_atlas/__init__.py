@@ -464,14 +464,21 @@ class OM3D_OT_atlas_material_preview(bpy.types.Operator):
 class OM3D_OT_atlas_revert(bpy.types.Operator):
     bl_idname = "om3d.atlas_revert"
     bl_label = "Revert"
-    bl_description = ("Put the original materials back, remove AtlasUV, and move the atlas textures "
-                      "and layout image the last Pack wrote into a _reverted folder")
+    bl_description = ("Put the original materials back and remove AtlasUV. The atlas textures and layout "
+                      "image the last Pack wrote are moved to a _reverted folder, deleted or kept: you choose")
     bl_options = {"REGISTER", "UNDO"}
 
-    delete_files: bpy.props.BoolProperty(
-        name="Remove Packed Textures", default=True,
-        description="Move the files the last Pack wrote (only those, and only if unchanged) into a "
-                    "_reverted folder next to them. Nothing is deleted. Undo doesn't move them back")
+    file_action: bpy.props.EnumProperty(
+        name="Packed Textures",
+        description="What happens to the files the last Pack wrote. Only those files, and only if they "
+                    "are unchanged since Pack. Your choice is remembered until Blender closes",
+        items=[("MOVE", "Move", "Move them into a _reverted folder next to them. Nothing is lost"),
+               ("DELETE", "Delete", "Delete them for good. Undo can't bring them back. "
+                                    "Handy while testing, so old atlases don't pile up"),
+               ("KEEP", "Keep", "Leave them where they are")],
+        default="MOVE")
+    # kept for scripts written against 0.4.3 / 0.4.4: False means the same as Keep
+    delete_files: bpy.props.BoolProperty(default=True, options={"HIDDEN", "SKIP_SAVE"})
 
     @classmethod
     def poll(cls, context):
@@ -494,11 +501,18 @@ class OM3D_OT_atlas_revert(bpy.types.Operator):
         if not files:
             return
         col.separator()
-        col.prop(self, "delete_files")
+        col.label(text="Packed textures:")
+        col.row(align=True).prop(self, "file_action", expand=True)
         box = col.box().column(align=True)
-        box.enabled = self.delete_files
-        folder = os.path.join(os.path.dirname(files[0]), packer.REVERTED_DIR)
-        box.label(text=f"{len(files)} files move to {folder}", icon="FILE_FOLDER")
+        box.enabled = self.file_action != "KEEP"
+        if self.file_action == "DELETE":
+            box.alert = True
+            box.label(text=f"{len(files)} files will be deleted for good. Undo can't restore them", icon="ERROR")
+        elif self.file_action == "MOVE":
+            folder = os.path.join(os.path.dirname(files[0]), packer.REVERTED_DIR)
+            box.label(text=f"{len(files)} files move to {folder}", icon="FILE_FOLDER")
+        else:
+            box.label(text=f"{len(files)} files stay where they are", icon="CHECKMARK")
         for p in files[:12]:
             box.label(text=os.path.basename(p), icon="DOT")
         if len(files) > 12:
@@ -506,17 +520,20 @@ class OM3D_OT_atlas_revert(bpy.types.Operator):
         col.label(text="Files changed since Pack, or still used in this file, stay where they are")
 
     def execute(self, context):
-        r = packer.revert(context, delete_files=self.delete_files)
+        action = self.file_action if self.delete_files else "KEEP"
+        r = packer.revert(context, delete_files=action != "KEEP", permanent=action == "DELETE")
         context.scene.om3d_atlas.last_report = ""
         msg = f"Reverted {r['objects']} objects"
-        if r["deleted"]:
+        if r["deleted"] and action == "DELETE":
+            msg += f", deleted {r['deleted']} files"
+        elif r["deleted"]:
             msg += f", moved {r['deleted']} files to {packer.REVERTED_DIR}"
         if r["kept"]:
             msg += f"; left in place: {', '.join(r['kept'][:3])}"
             if len(r["kept"]) > 3:
                 msg += f" and {len(r['kept']) - 3} more"
         if r["failed"]:
-            msg += f"; couldn't move {', '.join(r['failed'][:3])}"
+            msg += f"; couldn't remove {', '.join(r['failed'][:3])}"
             self.report({"WARNING"}, msg)
         else:
             self.report({"INFO"}, msg)

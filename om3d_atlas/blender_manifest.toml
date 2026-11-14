@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "om3d_atlas"
-version = "0.4.4"
+version = "0.4.5"
 name = "OM3D Atlas"
 tagline = "Pack texture sets into fewer atlases with texel density checks"
 maintainer = "Aunmar <info@onmars3d.com>"
@@ -12,4 +12,4 @@ blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
-files = "Read source textures, write and remove atlas textures"
+files = "Read source textures, write and delete atlas textures"
