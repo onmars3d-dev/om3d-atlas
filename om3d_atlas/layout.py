@@ -112,7 +112,7 @@ def render(context):
     px[..., 3] = 1.0
     name = image_name(state)
     old = bpy.data.images.get(name)
-    if old is not None:
+    if old is not None and old.get("om3d_atlas_layout"):  # only replace our own layout image
         bpy.data.images.remove(old)
     img = bpy.data.images.new(name, W, H)
     img.pixels.foreach_set(px.ravel())

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.4 (2026-11-13)
+
+- Revert no longer deletes anything. It moves the files the last Pack wrote into a `_reverted` folder next to them, and only files that are unchanged since Pack (same size and modified time). A texture you repainted or re-exported, a file another image in the .blend still uses, and anything that isn't a texture all stay where they are and are listed.
+- The Revert dialog now shows the Remove Packed Textures checkbox and the file names before anything happens. In 0.4.3 the option only appeared after the files were gone.
+- Reverting with the option off forgets the file list, so a later Revert can't take files you chose to keep. A list saved by 0.4.3 is never acted on.
+- Pack records each file as it is written, so a Pack that stops halfway still knows its files.
+- Scan, Auto Plan, Pack and Revert only run in Object Mode.
+- New problems that block Pack with a plain message: a texture file missing on disk, a mesh that already has 8 UV maps, an empty output folder, a prefix, suffix or set name with a character a file name can't use, and UDIM UVs outside the UDIM range.
+- A material slot with no faces no longer makes a UDIM material look like it uses two tiles.
+- If Pack hits an unexpected error it reports it in the status bar instead of a Python traceback.
+- Layout Image no longer removes an image of the same name that it didn't create.
+- The manifest declares the files permission, and the tagline fits Blender's 64 character limit.
+
 ## v0.4.3 (2026-11-04)
 
 - Revert now deletes the atlas textures and layout image the last Pack wrote (only those files, and not any that an image in the file still uses). The confirm dialog says how many files it will delete; a "Delete Packed Textures" option turns it off.

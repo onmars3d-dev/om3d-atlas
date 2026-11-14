@@ -91,7 +91,7 @@ def _stem(image):
 def discover(material, types):
     """Return ({key: image_node}, [unclassified image nodes])."""
     found = {}
-    if not material or not material.use_nodes or not material.node_tree:
+    if not material or not getattr(material, "use_nodes", True) or not material.node_tree:
         return found, []
     nt = material.node_tree
     images = [n for n in nt.nodes if n.type == "TEX_IMAGE" and n.image]

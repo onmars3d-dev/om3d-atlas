@@ -2,6 +2,7 @@
 """Scan, plan, pack and revert. Works on the scene state (Scene.om3d_atlas)."""
 import json
 import os
+import re
 
 import bpy
 import numpy as np
@@ -20,7 +21,9 @@ P_IMAGES = "om3d_atlas_images"    # material: comma list of atlas images
 P_ISOLATED = "om3d_atlas_isolated"  # scene: JSON list of objects hidden by Show Only Packed
 P_FAKE = "om3d_atlas_fake"        # material: fake user set by Pack (Revert clears it)
 P_COLOR = "om3d_atlas_color"      # object: original viewport colour before Preview Colors
-P_WRITTEN = "om3d_atlas_written"  # scene: JSON list of files the last Pack wrote (Revert deletes them)
+P_WRITTEN = "om3d_atlas_written"  # scene: JSON list of {p, size, mtime} for files the last Pack wrote
+REVERTED_DIR = "_reverted"        # Revert moves the packed files here instead of deleting them
+BAD_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')  # characters a file name can't hold
 
 EXT = {"TARGA": ".tga", "PNG": ".png"}
 OP_KEY = "OP"
@@ -151,7 +154,7 @@ def _scan(context):
             it.set_name, it.exclude, it.override, it.op_mode, it.plan_tile, it.plan_kind = keep[m.name]
         it.roles_raw = ",".join(t.key for t in types if t.key in found)
         st = stats.get(m.name, [])
-        all_tiles = sorted({s.tile for s in st if not s.uv_out})
+        all_tiles = sorted({s.tile for s in st if not s.uv_out and s.bbox is not None})
         tile = all_tiles[0] if all_tiles else (0, 0)
         it.src_tile_u, it.src_tile_v = tile
         udim = [n.image for n in found.values() if n.image.source == "TILED"]
@@ -159,6 +162,8 @@ def _scan(context):
         if udim and len(all_tiles) > 1:
             udim_err = (f"UDIM texture but its objects use {len(all_tiles)} tiles: "
                         + ", ".join(f"{imaging.udim_number(t)}" for t in all_tiles[:4]))
+        elif udim and not (0 <= tile[0] <= 9 and tile[1] >= 0):
+            udim_err = f"UDIM texture but its UVs sit in tile u{tile[0]} v{tile[1]}, outside the UDIM range"
         elif udim:
             missing = [i.name for i in udim if imaging.tile_path(i, tile) is None]
             if missing:
@@ -202,12 +207,17 @@ def _scan(context):
             notes.append("UVs span more than one 0-1 tile: " + _names(out))
         if udim_err:
             notes.append(udim_err)
+        # a texture whose file is missing loads as 0 x 0 pixels and can't be packed
+        no_data = sorted({n.image.name for n in found.values()
+                          if n.image.source != "TILED" and 0 in tuple(n.image.size)})
+        if no_data:
+            notes.append("Texture file missing: " + _names(no_data))
         if rest:
             notes.append("Unknown images: " + _names([n.image.name for n in rest]))
         if not found:
             notes.append("No textures found")
         it.note = " | ".join(notes)
-        it.uv_error = bool(out or no_uv or udim_err)
+        it.uv_error = bool(out or no_uv or udim_err or no_data)
         it.udim = bool(udim)
         if not found:
             it.exclude = True
@@ -311,8 +321,13 @@ def problems(context):
     """Blocking problems for Pack, as a list of strings."""
     state = context.scene.om3d_atlas
     out = []
-    if not bpy.data.filepath and state.output_dir.startswith("//"):
+    if not state.output_dir.strip():
+        out.append("Set an output folder")
+    elif not bpy.data.filepath and state.output_dir.startswith("//"):
         out.append("Save the .blend first (output path is relative)")
+    for label, text in (("Prefix", state.prefix), ("Suffix", state.suffix)):
+        if BAD_NAME.search(text):
+            out.append(f"{label} has a character a file name can't use")
     if packed_objects(context):
         out.append("Scene is already packed: Revert first")
     active = [it for it in state.items if not it.exclude]
@@ -321,11 +336,27 @@ def problems(context):
     for it in active:
         if not it.set_name.strip():
             out.append(f"{it.name}: no set")
+        elif BAD_NAME.search(it.set_name):
+            out.append(f"Set {it.set_name}: has a character a file name can't use")
         if it.flag == planner.FLAG_NOFIT:
             out.append(f"{it.name}: set {it.set_name} does not fit {state.max_size}")
         if it.uv_error:
             out.append(f"{it.name}: {it.note}")
-    out += _shared_mesh_conflicts(context, {it.name for it in active})
+    names = {it.name for it in active}
+    out += _shared_mesh_conflicts(context, names)
+    # Pack adds one UV map (AtlasUV); Blender allows 8 per mesh
+    full = []
+    seen = set()
+    for obj in density.mesh_objects(context):
+        me = obj.data
+        if me in seen:
+            continue
+        seen.add(me)
+        if (len(me.uv_layers) >= 8 and ATLAS_UV not in me.uv_layers
+                and any(s.material and s.material.name in names for s in obj.material_slots)):
+            full.append(obj.name)
+    if full:
+        out.append("Already has 8 UV maps (Blender's limit), remove one: " + _names(full))
     return out
 
 
@@ -563,6 +594,9 @@ def pack(context, progress=None):
     bad = problems(context)
     if bad:
         raise RuntimeError("; ".join(bad[:5]))
+    # a new Pack starts a new list: files from an earlier Pack the user kept are theirs now
+    if P_WRITTEN in context.scene:
+        del context.scene[P_WRITTEN]
     types = map_types(context)
     types_by_key = {t.key: t for t in types}
     order = [t.key for t in types]
@@ -604,6 +638,8 @@ def pack(context, progress=None):
             path = os.path.join(out_dir, name + ext)
             images[key] = imaging.save(name, atlas, path, mt.colorspace, state.file_format, has_alpha)
             written.append(path)
+            record_written(context, path)  # straight away, so a failed Pack still knows its files
+            del atlas
             if progress:
                 progress(name)
         template = max(members, key=lambda it: len(found[it.name]))
@@ -659,48 +695,97 @@ def pack(context, progress=None):
         if m is not None and not m.use_fake_user:
             m.use_fake_user = True
             m[P_FAKE] = True
-    context.scene[P_WRITTEN] = json.dumps([os.path.normpath(p) for p in written])
     return {"sets": len(sets), "images": len(written), "meshes": meshes, "dir": out_dir}
 
 
+def _norm(path):
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _same_path(a, b):
+    return os.path.normcase(_norm(a)) == os.path.normcase(_norm(b))
+
+
+def _records(scene):
+    """The written-files list as [{p, size, mtime}]. Lists saved by 0.4.3 and older hold
+    bare paths; those come back with size None and are never removed (can't be verified)."""
+    try:
+        raw = json.loads(scene.get(P_WRITTEN, "[]"))
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for r in raw if isinstance(raw, list) else []:
+        if isinstance(r, str):
+            out.append({"p": r, "size": None, "mtime": None})
+        elif isinstance(r, dict) and isinstance(r.get("p"), str):
+            out.append({"p": r["p"], "size": r.get("size"), "mtime": r.get("mtime")})
+    return out
+
+
 def record_written(context, path):
-    """Add a file (e.g. the layout PNG) to the list Revert deletes."""
-    files = json.loads(context.scene.get(P_WRITTEN, "[]"))
-    path = os.path.normpath(path)
-    if path not in files:
-        files.append(path)
-    context.scene[P_WRITTEN] = json.dumps(files)
+    """Remember a file Pack just wrote (an atlas texture or the layout PNG), with its size
+    and modified time. Revert only removes a file that still matches both."""
+    path = _norm(path)
+    recs = [r for r in _records(context.scene) if not _same_path(r["p"], path)]
+    try:
+        st = os.stat(path)
+        recs.append({"p": path, "size": st.st_size, "mtime": st.st_mtime_ns})
+    except OSError:
+        return
+    context.scene[P_WRITTEN] = json.dumps(recs)
 
 
 def written_files(context):
     """Files the last Pack wrote that are still on disk."""
-    return [p for p in json.loads(context.scene.get(P_WRITTEN, "[]")) if os.path.isfile(p)]
+    return [r["p"] for r in _records(context.scene) if os.path.isfile(r["p"])]
 
 
 # --------------------------------------------------------------------------
 # Revert
 # --------------------------------------------------------------------------
 
+def _unchanged(rec):
+    """True when the file on disk is still the one Pack wrote."""
+    if rec["size"] is None or rec["mtime"] is None:
+        return False
+    try:
+        st = os.stat(rec["p"])
+    except OSError:
+        return False
+    return st.st_size == rec["size"] and st.st_mtime_ns == rec["mtime"]
+
+
 def _delete_written(context):
-    """Delete the files the last Pack wrote, unless an image still in the file uses one."""
-    files = json.loads(context.scene.get(P_WRITTEN, "[]"))
-    in_use = {os.path.normpath(bpy.path.abspath(i.filepath)) for i in bpy.data.images
-              if i.filepath and i.users}
-    deleted, kept, failed = 0, [], []
-    for p in files:
+    """Take away the files the last Pack wrote. Nothing is deleted: each file is moved to a
+    "_reverted" folder next to it, so a file another .blend still uses can be put back.
+    A file is left alone when an image in this .blend still uses it, when it isn't a
+    texture, or when it changed since Pack (repainted, re-exported, or not ours at all).
+    Returns (moved, kept names, failed names)."""
+    in_use = {os.path.normcase(_norm(bpy.path.abspath(i.filepath, library=i.library)))
+              for i in bpy.data.images if i.filepath and i.users}
+    exts = set(EXT.values())
+    moved, kept, failed = 0, [], []
+    for rec in _records(context.scene):
+        p = rec["p"]
         if not os.path.isfile(p):
             continue
-        if p in in_use:
-            kept.append(os.path.basename(p))
+        base = os.path.basename(p)
+        if os.path.normcase(_norm(p)) in in_use:
+            kept.append(base + " (still used in this file)")
+            continue
+        if os.path.splitext(p)[1].lower() not in exts or not _unchanged(rec):
+            kept.append(base + " (changed since Pack)")
             continue
         try:
-            os.remove(p)
-            deleted += 1
+            folder = os.path.join(os.path.dirname(p), REVERTED_DIR)
+            os.makedirs(folder, exist_ok=True)
+            os.replace(p, os.path.join(folder, base))
+            moved += 1
         except OSError:
-            failed.append(os.path.basename(p))
+            failed.append(base)
     if P_WRITTEN in context.scene:
         del context.scene[P_WRITTEN]
-    return deleted, kept, failed
+    return moved, kept, failed
 
 
 def revert(context, delete_files=True):
@@ -744,9 +829,15 @@ def revert(context, delete_files=True):
             del m[P_FAKE]
     for img in [i for i in bpy.data.images if i.get("om3d_atlas_layout") and i.users == 0]:
         bpy.data.images.remove(img)
-    deleted, kept, failed = _delete_written(context) if delete_files else (0, [], [])
-    state = context.scene.om3d_atlas
     if delete_files:
+        deleted, kept, failed = _delete_written(context)
+    else:
+        deleted, kept, failed = 0, [], []
+        # the user is keeping these files: forget them, so no later Revert can take them
+        if P_WRITTEN in context.scene:
+            del context.scene[P_WRITTEN]
+    state = context.scene.om3d_atlas
+    if delete_files and not (state.layout_path and os.path.isfile(state.layout_path)):
         state.layout_path = ""
     preview_restore(context, shading=False)
     state.results.clear()

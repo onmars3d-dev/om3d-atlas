@@ -100,7 +100,6 @@ def _tile_items(self, context):
 
 def _move_items(self, context):
     state = context.scene.om3d_atlas
-    it = state.items[self.index] if 0 <= self.index < len(state.items) else None
     names = [st.name for st in state.sets]
     items = [(n, n, f"Move to {n}", i) for i, n in enumerate(names)]
     items.append(("__NEW__", "New Set", "Move to a new set of its own", len(items)))
@@ -328,6 +327,13 @@ class OM3D_OT_atlas_scan(bpy.types.Operator):
     bl_description = "Find every material on visible-layer meshes, its maps, its opacity and its worst texel density"
     bl_options = {"REGISTER"}
 
+    @classmethod
+    def poll(cls, context):
+        if context.mode != "OBJECT":
+            cls.poll_message_set("Switch to Object Mode first")
+            return False
+        return True
+
     def execute(self, context):
         n = packer.scan(context)
         self.report({"INFO"}, f"{n} materials")
@@ -341,6 +347,13 @@ class OM3D_OT_atlas_auto_plan(bpy.types.Operator):
                       "Edit the set names afterwards")
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        if context.mode != "OBJECT":
+            cls.poll_message_set("Switch to Object Mode first")
+            return False
+        return True
+
     def execute(self, context):
         if not len(context.scene.om3d_atlas.items):
             packer.scan(context)
@@ -351,8 +364,16 @@ class OM3D_OT_atlas_auto_plan(bpy.types.Operator):
 class OM3D_OT_atlas_pack(bpy.types.Operator):
     bl_idname = "om3d.atlas_pack"
     bl_label = "Pack Atlases"
-    bl_description = "Write the atlas textures, create the atlas materials and AtlasUV (UV channel 0)"
+    bl_description = ("Write the atlas textures, create the atlas materials and AtlasUV (UV channel 0). "
+                      "To undo a Pack use Revert, not Ctrl+Z: undo can't take back the files")
     bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != "OBJECT":
+            cls.poll_message_set("Switch to Object Mode first")
+            return False
+        return True
 
     def invoke(self, context, event):
         files = packer.planned_files(context)
@@ -378,6 +399,11 @@ class OM3D_OT_atlas_pack(bpy.types.Operator):
         except RuntimeError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        except Exception as exc:  # anything unexpected: say so plainly instead of a traceback
+            import traceback
+            traceback.print_exc()
+            self.report({"ERROR"}, f"Pack stopped: {exc}. Click Revert (or Ctrl+Z) to put the scene back")
+            return {"FINISHED"}  # keep the undo step: some objects may already be changed
         msg = f"{r['sets']} sets, {r['images']} textures, {r['meshes']} meshes"
         state = context.scene.om3d_atlas
         state.last_report = msg
@@ -438,33 +464,59 @@ class OM3D_OT_atlas_material_preview(bpy.types.Operator):
 class OM3D_OT_atlas_revert(bpy.types.Operator):
     bl_idname = "om3d.atlas_revert"
     bl_label = "Revert"
-    bl_description = ("Put the original materials back, remove AtlasUV, and delete the atlas textures "
-                      "and layout image the last Pack wrote")
+    bl_description = ("Put the original materials back, remove AtlasUV, and move the atlas textures "
+                      "and layout image the last Pack wrote into a _reverted folder")
     bl_options = {"REGISTER", "UNDO"}
 
     delete_files: bpy.props.BoolProperty(
-        name="Delete Packed Textures", default=True,
-        description="Delete the files the last Pack wrote (only those). Undo can't bring them back")
+        name="Remove Packed Textures", default=True,
+        description="Move the files the last Pack wrote (only those, and only if unchanged) into a "
+                    "_reverted folder next to them. Nothing is deleted. Undo doesn't move them back")
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != "OBJECT":
+            cls.poll_message_set("Switch to Object Mode first")
+            return False
+        return True
 
     def invoke(self, context, event):
-        n = len(packer.written_files(context))
         wm = context.window_manager
-        msg = (f"Restore the original materials and delete {n} packed files. Undo can't restore deleted files"
-               if n and self.delete_files else "Restore the original materials")
         try:
-            return wm.invoke_confirm(self, event, title="Revert Atlas", message=msg,
-                                     confirm_text="Revert", icon="WARNING" if n else "NONE")
-        except TypeError:
-            return wm.invoke_confirm(self, event)
+            return wm.invoke_props_dialog(self, width=420, title="Revert Atlas", confirm_text="Revert")
+        except TypeError:      # Blender < 4.1: no custom text
+            return wm.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.label(text="Restore the original materials and remove AtlasUV")
+        files = packer.written_files(context)
+        if not files:
+            return
+        col.separator()
+        col.prop(self, "delete_files")
+        box = col.box().column(align=True)
+        box.enabled = self.delete_files
+        folder = os.path.join(os.path.dirname(files[0]), packer.REVERTED_DIR)
+        box.label(text=f"{len(files)} files move to {folder}", icon="FILE_FOLDER")
+        for p in files[:12]:
+            box.label(text=os.path.basename(p), icon="DOT")
+        if len(files) > 12:
+            box.label(text=f"... and {len(files) - 12} more")
+        col.label(text="Files changed since Pack, or still used in this file, stay where they are")
 
     def execute(self, context):
         r = packer.revert(context, delete_files=self.delete_files)
         context.scene.om3d_atlas.last_report = ""
-        msg = f"Reverted {r['objects']} objects, deleted {r['deleted']} files"
+        msg = f"Reverted {r['objects']} objects"
+        if r["deleted"]:
+            msg += f", moved {r['deleted']} files to {packer.REVERTED_DIR}"
         if r["kept"]:
-            msg += f"; kept {len(r['kept'])} still used in this file"
+            msg += f"; left in place: {', '.join(r['kept'][:3])}"
+            if len(r["kept"]) > 3:
+                msg += f" and {len(r['kept']) - 3} more"
         if r["failed"]:
-            msg += f"; couldn't delete {', '.join(r['failed'][:3])}"
+            msg += f"; couldn't move {', '.join(r['failed'][:3])}"
             self.report({"WARNING"}, msg)
         else:
             self.report({"INFO"}, msg)

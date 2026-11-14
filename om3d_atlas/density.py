@@ -8,7 +8,6 @@ object.
 import math
 
 import bmesh
-import bpy
 
 UV_EPS = 1e-3
 
@@ -114,7 +113,11 @@ def gather(context, materials):
             else:
                 m.uv_area += st.uv_area
                 m.world_cm2 += st.world_cm2
-                m.uv_out = m.uv_out or st.uv_out or (m.tile != st.tile)
+                if st.bbox is not None:      # a slot with no faces has no tile of its own
+                    if m.bbox is None:
+                        m.bbox, m.tile, m.uv_out = st.bbox, st.tile, st.uv_out
+                    else:
+                        m.uv_out = m.uv_out or st.uv_out or (m.tile != st.tile)
                 m.no_uv = m.no_uv or st.no_uv
         for name, st in merged.items():
             out[name].append(st)
